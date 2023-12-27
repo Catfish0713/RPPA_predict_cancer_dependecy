@@ -1,0 +1,504 @@
+---
+title: "RPPA"
+author: "Ruixi Li"
+date: "2023-11-26"
+output: html_document
+---
+
+
+
+```{r setup, message = FALSE}
+library(readr)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(purrr)
+library(skimr)
+library(party)
+```
+
+# Data Preparation
+
+## Outcome
+
+### Clean CRISPR data
+```{r, message=FALSE}
+# load CRISPR data
+CRISPR = read_csv("data/gene_dependency_corrected.csv") |>
+  rename(dep_map_id = line)
+# 558 cell lines x 17,634 genes
+
+# remove the numbers following the gene names
+colnames(CRISPR) = gsub(" \\(.*\\)", "", colnames(CRISPR)) 
+
+# load cellmatch data(I separate the data in excel and rename the file as "cellline_match.cvs")
+cell_match = read_csv("data/DepMap-2019q1-celllines_v2.csv") |> 
+  janitor::clean_names() |>
+  select(1,2) |> rename(ccle_id = ccle_name)
+
+# replace ccle_id with dep_map_id
+CRISPR_match = left_join(CRISPR, cell_match, by='dep_map_id') |> select(-dep_map_id) |>
+  select(ccle_id, everything())
+
+
+```
+
+```{r overview_CRISPR,include=FALSE}
+unique(colnames(CRISPR[,-1]))#not duplicate, maybe researchers delete 2 genes before analysis
+
+sum(is.na(CRISPR_match)) #no missing
+str(CRISPR) # all numeric except the first column
+```
+
+### clean shRNA
+
+```{r clean shRNA,warning=FALSE,message=FALSE}
+shRNA = read_csv("data/D2_combined_gene_dep_scores.csv") |> 
+  pivot_longer(cols = -1,
+               names_to = "ccle_id") |>
+  pivot_wider(
+    names_from = 1
+  )
+# 712 cell lines X 17310 genes 
+
+# remove the numbers following the gene names
+colnames(shRNA) = gsub(" \\(.*\\)", "", colnames(shRNA)) 
+
+
+
+```
+
+
+```{r overview_CRISPR_match,include=FALSE}
+unique(colnames(shRNA))# no duplicate, maybe researchers delete 2 genes before analysis
+sum(is.na(shRNA)) #no missing
+str(shRNA) # all numeric except the first column
+```
+
+
+# Figure 3
+
+## Fig 3 A-B
+```{r 3 A-B,warning=FALSE,message=FALSE}
+library(ggVennDiagram)
+library(grid)
+
+genes_crispr = names(CRISPR)[-1]  # Replace with actual gene names from CRISPR/Cas9 data
+genes_shrna = names(shRNA)[-1]   # Replace with actual gene names from shRNA data
+
+cell_lines_crispr = CRISPR_match |> select(ccle_id)|> pull()       # Replace with actual cell line names from CRISPR/Cas9 data
+
+cell_lines_shrna = shRNA |> select(ccle_id) |> pull()        # Replace with actual cell line names from shRNA data
+
+
+gene_venn = ggVennDiagram(x = list(CRISPR = genes_crispr, shRNA = genes_shrna),
+              category.names = c("CRISPR/Cas9", "shRNA"),
+              label = "both",
+              label_percent_digit = 1,
+              label_alpha = 0) + 
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  scale_x_continuous(expand = expansion(mult = .3))
+
+
+ggsave("gene_venn.png",width = 4, height = 4)
+
+
+# Plot Venn Diagram for Cell Lines
+cell_venn = ggVennDiagram(x = list(CRISPR = cell_lines_crispr, shRNA = cell_lines_shrna),
+              category.names = c("CRISPR/Cas9", "shRNA"),
+              label = "both",
+              label_percent_digit = 1,
+              label_alpha = 0) + 
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  scale_x_continuous(expand = expansion(mult = .3))
+
+
+
+
+ggsave("cell_venn.png",width = 4, height = 4)
+
+
+```
+
+## Fig 3 C-D
+
+```{r 3 C-D,warning=FALSE,message=FALSE}
+# Get the common genes(in column)
+intersection_cell = intersect(names(CRISPR_match), names(shRNA))
+intersection_cell_CRISPR = CRISPR_match |> select(intersection_cell)
+intersection_cell_shRNA = shRNA |> select(intersection_cell)
+
+# Get the common cell lines(in row)
+intersection_gene = intersect(intersection_cell_CRISPR$ccle_id, intersection_cell_shRNA$ccle_id)
+
+# Get the two comparable datasets from CRISPR and shRNA
+intersection_cell_CRISPR = intersection_cell_CRISPR |> filter(ccle_id %in% intersection_gene) |> arrange(ccle_id)
+intersection_cell_shRNA = intersection_cell_shRNA |> filter(ccle_id %in% intersection_gene) |>arrange(ccle_id)
+# 403 cell lines X 14915 genes
+
+
+# Calculate correlations for cell lines (C)
+cell_correlation = sapply(1:403, function(i) {
+  cor.test(as.numeric(unlist(intersection_cell_shRNA[i,])), as.numeric(unlist(intersection_cell_CRISPR[i,])))|> broom::tidy() |> select(estimate, p.value) |> mutate(p_adjusted = p.adjust(p.value, method = "fdr", n = 403))
+})
+
+cell_correlation = cell_correlation |> t() |> as_tibble() |> unnest(estimate) |>
+  mutate(category = ifelse(p.value < 0.01 & p_adjusted < 0.1 & abs(estimate) >= 0.3,"Significant correlated cell lines","All cell lines"))
+
+# Plot Histogram for Correlations of Cell Lines (C)
+corr_cell_plot = ggplot(cell_correlation, aes(x = estimate, fill = category)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.5) +
+  scale_fill_manual(values = c("All cell lines" = "blue", "Significant correlated cell lines" = "orange")) +
+  theme(legend.position = "top") +
+  labs(x = "Pearson Correlation",
+       y = "Count")
+
+ggsave("corr_cell_plot.png",width = 4, height = 4)
+
+
+# Calculate correlations for genes (D)
+gene_correlation = sapply(2:14916, function(i) {
+  cor.test(as.numeric(unlist(intersection_cell_shRNA[,i])), as.numeric(unlist(intersection_cell_CRISPR[,i]))) |> broom::tidy() |> select(estimate, p.value) |> mutate(p_adjusted = p.adjust(p.value, method = "fdr", n = 14915))
+}) 
+
+gene_correlation = gene_correlation |> t() |> as_tibble() |> unnest(estimate) |>
+  mutate(category = ifelse(p.value < 0.01 & p_adjusted < 0.1 & abs(estimate) >= 0.3,"Significant correlated genes","All genes"))
+
+
+
+# Plot Histogram for Correlations of Genes (D)
+corr_gene_plot = ggplot(gene_correlation, aes(x = estimate, fill = category)) +
+  geom_histogram(position = "identity", binwidth = 0.05, alpha = 0.5) +
+  scale_fill_manual(values = c("All genes" = "blue", "Significant correlated genes" = "orange")) +
+  theme(legend.position = "top") +
+  labs(x = "Pearson Correlation",
+       y = "Count")
+
+ggsave("corr_gene_plot.png",width = 4, height = 4)
+
+```
+
+## Predictors
+
+### Clean RPPA
+```{r message=FALSE,warning=FALSE}
+# load RPPA data
+RPPA = read_csv("data/CCLE_RPPA_20181003.csv")
+# 214 protein markers across 899 cell lines
+#import the gene-antibody lookup table, only keep the validated, unique pairs
+gene_protein = read_csv("data/For_AbGeneMatch_CCLE_RPPA_Ab_info_20181226.csv") |>
+  janitor::clean_names()|>
+  filter(validation_status == "Validated",
+         !str_detect(target_genes," ")) |>
+  distinct(target_genes, .keep_all = TRUE)
+
+
+# Convert lookup table to named vector
+names_vector = setNames(gene_protein$target_genes, gene_protein$antibody_name)
+# Rename columns in 'data'
+colnames(RPPA) = names_vector[colnames(RPPA)]
+#rename the first blank colname
+colnames(RPPA)[1] = "ccle_id"
+# get 10 genes of interest from the validated_tested, unique 115 genes
+# since I can get 108 corresponding cancer dependency data, it's enough, I wan to select genes of interest here to simplify(varified genes without multiple matching with RPPA )
+RPPA = RPPA[,!is.na(colnames(RPPA))] 
+RPPA = RPPA[,order(colnames(RPPA))] |> select(ccle_id,everything())
+skim(RPPA)
+# Normalize data (important for linear regression)
+preProcessNorm = preProcess(RPPA, method = c("range"))
+RPPA = predict(preProcessNorm, RPPA)
+skim(RPPA)
+
+# apply(RPPA[-1],1,qqnorm); apply(RPPA[-1],1,qqline) QQ-plot shows that using "range" methods can better transform RPPA to be more normalized compared with c("center","scale") methods
+
+# or using PCA to reduce the dimension
+
+
+
+
+```
+
+```{r overview_RPPA, include=FALSE}
+sum(is.na(RPPA)) #no missing
+str(RPPA) # all numeric except the first column
+summary(RPPA)
+RPPA |> select(contains("caution")) # there's 75 rows that have "_caution" warning, should pay attention to them
+unique(colnames(RPPA[,-1])) #no duplicate sample
+
+```
+
+
+```{r overview_cell_match, include=FALSE}
+sum(is.na(cell_match))# 4 missing 
+ cell_match |>
+  filter(is.na(ccle_id)|is.na(dep_map_id)) # 4 dep_map_id missing
+```
+
+
+## clean mRNA expression
+
+### clean CNA
+
+### clean DNA methylation
+
+
+
+# combine the datasets
+
+```{r}
+
+# Find the common column names between the selected RPPA data and CRISPR/Cas9 data
+common_columns = intersect(names(RPPA), names(CRISPR_match))
+CRISPR_match = CRISPR_match[,common_columns]
+# data normalization for outcome data is not necessary for the three ml algorithms
+
+# Find the common column names between the selected RPPA data and CRISPR/Cas9 data
+common_columns2 = intersect(names(RPPA), names(shRNA))
+
+
+# data normalization for outcome data is not necessary for the three ml algorithms
+
+
+# rename RPPA colnames by adding "_RPPA"
+colnames(RPPA)[-1] = paste0(colnames(RPPA)[-1],"_RPPA")
+# rename CRISPR_match colnames by adding "_dependency"
+colnames(CRISPR_match)[-1] = paste0(colnames(CRISPR_match)[-1],"_dependency")
+
+RPPA_match = inner_join(RPPA, cell_match, by='ccle_id')
+RPPA_CRISPR = inner_join(RPPA_match, CRISPR_match, by='ccle_id') |> arrange(ccle_id) |>
+  select(ccle_id, everything(),-AR_RPPA,-dep_map_id) |>
+  select(1,2:21,112:131) 
+  
+# select more genes here-13 pairs
+
+```
+
+```{r, include=FALSE}
+# check if the merge if correct
+anti_join(RPPA_match,CRISPR_match) #453
+anti_join(CRISPR_match,RPPA_match) #114
+```
+
+
+
+# Schema 2: Machine learning
+
+## Initialize containers for results
+
+
+```{r,message=FALSE}
+results_train = data.frame(gene = character(), model_type = character(), rmse = numeric(), r2 = numeric(), stringsAsFactors = FALSE)
+results_test = data.frame(gene = character(), model_type = character(), rmse = numeric(), r2 = numeric(), stringsAsFactors = FALSE)
+final_models = list()
+write.csv(RPPA_CRISPR,"RPPA_CRISPR.csv")
+```
+
+
+# Iteration
+
+```{r ml,message=FALSE,warning=FALSE}
+common_name = common_columns[2:21]
+for (gene in common_name) {
+  # Prepare data for the current gene
+  gene_data = RPPA_CRISPR |> select(paste0(gene, "_RPPA"), paste0(gene, "_dependency"))
+  colnames(gene_data) = c("RPPA", "dependency")
+  set.seed(123)
+  # Split data into training and testing sets
+  trainIndex = createDataPartition(gene_data$dependency, p = 0.7, list = FALSE)
+  data_train = gene_data[trainIndex, ]
+  data_test = gene_data[-trainIndex, ]
+
+  # Baseline model: average dependency score
+  avg_dependency_train = mean(data_train$dependency)
+  baseline_predictions_train = rep(avg_dependency_train, nrow(data_train))
+  rmse_baseline_train = RMSE(baseline_predictions_train, data_train$dependency)
+  
+  avg_dependency_test = mean(data_test$dependency)
+  baseline_predictions_test = rep(avg_dependency_test, nrow(data_test))
+  rmse_baseline_test = RMSE(baseline_predictions_test, data_test$dependency)
+
+  # Avoid overfitting
+  control = trainControl(method="repeatedcv", number=10, repeats=10, summaryFunction=defaultSummary)
+
+  # Train models
+  model_lm_train = train(dependency ~ RPPA, data = data_train, method = "lm", trControl = control)
+  model_rf_train = train(dependency ~ RPPA, data = data_train, method = "rf", trControl = control)
+  model_crf_train = train(dependency ~ RPPA, data = data_train, method = "cforest", trControl = control)
+
+  # Model evaluation
+  
+  # for training data
+  predictions_lm_train = predict(model_lm_train, newdata = data_train)
+  predictions_rf_train = predict(model_rf_train, newdata = data_train)
+  predictions_crf_train = predict(model_crf_train, newdata = data_train)
+
+  rmse_lm_train = RMSE(predictions_lm_train, data_train$dependency)
+  rmse_rf_train = RMSE(predictions_rf_train, data_train$dependency)
+  rmse_crf_train = RMSE(predictions_crf_train, data_train$dependency)
+
+  r2_lm_train = R2(predictions_lm_train, data_train$dependency)
+  r2_rf_train = R2(predictions_rf_train, data_train$dependency)
+  r2_crf_train = R2(predictions_crf_train, data_train$dependency)
+  
+  #for testing data
+  predictions_lm_test = predict(model_lm_train, newdata = data_test)
+  predictions_rf_test = predict(model_rf_train, newdata = data_test)
+  predictions_crf_test = predict(model_crf_train, newdata = data_test)
+
+  rmse_lm_test = RMSE(predictions_lm_test, data_test$dependency)
+  rmse_rf_test = RMSE(predictions_rf_test, data_test$dependency)
+  rmse_crf_test = RMSE(predictions_crf_test, data_test$dependency)
+
+  r2_lm_test = R2(predictions_lm_test, data_test$dependency)
+  r2_rf_test = R2(predictions_rf_test, data_test$dependency)
+  r2_crf_test = R2(predictions_crf_test, data_test$dependency)
+  
+  
+
+  # Store results
+  results_train = rbind(results_train, data.frame(gene = gene, model_type = "Baseline", rmse = rmse_baseline_train, r2 = 0))
+  results_train = rbind(results_train, data.frame(gene = gene, model_type = "LM", rmse = rmse_lm_train, r2 = r2_lm_train))
+  results_train = rbind(results_train, data.frame(gene = gene, model_type = "RF", rmse = rmse_rf_train, r2 = r2_rf_train))
+  results_train = rbind(results_train, data.frame(gene = gene, model_type = "CRF", rmse = rmse_crf_train, r2 = r2_crf_train))
+  results_test = rbind(results_test, data.frame(gene = gene, model_type = "Baseline", rmse = rmse_baseline_test, r2 = 0))
+  results_test = rbind(results_test, data.frame(gene = gene, model_type = "LM", rmse = rmse_lm_test, r2 = r2_lm_test))
+  results_test = rbind(results_test, data.frame(gene = gene, model_type = "RF", rmse = rmse_rf_test, r2 = r2_rf_test))
+  results_test = rbind(results_test, data.frame(gene = gene, model_type = "CRF", rmse = rmse_crf_test, r2 = r2_crf_test))
+
+  # Flag predictable dependencies and retrain the best model
+  if (any(rmse_lm_test < rmse_baseline_test, rmse_rf_test < rmse_baseline_test, rmse_crf_test < rmse_baseline_test)) {
+    r2_values = c(r2_lm_test, r2_rf_test, r2_crf_test)
+    best_model_index = which.max(r2_values)
+    best_model_type = c("LM", "RF", "CRF")[best_model_index]
+
+    if (best_model_type == "LM") {
+      final_models[[gene]] = lm(dependency ~ RPPA, data = gene_data)
+    } else if (best_model_type == "RF") {
+      final_models[[gene]] = randomForest(dependency ~ RPPA, data = gene_data)
+    } else if (best_model_type == "CRF") {
+      final_models[[gene]] = cforest(dependency ~ RPPA, data = gene_data)
+    }
+  }
+}
+
+
+```
+
+
+According to the results in final_models, 15 genes have predictable dependency from the 20 genes of interest.
+
+# Figure 4
+
+the plot in fig 4 aims to show the proportion of genes that can successfully predict cancer dependency in test data; I think the results of train data are shown to compare the behaviour of test data and train data, which indicate if there's overfitting or underfitting.
+
+I modified the iterration function to get "results_train" and "results_test", which are the results generated by "best-model-identifying" function trained from train data(not the whole dataset).
+
+
+## combine train_result and test_result in a long format
+
+```{r bind_row}
+compare = bind_rows(train = results_train, test = results_test, .id = "split")
+
+```
+
+## visulaization like fig 4
+
+I tried to use traditional methods to compare the behavior of train data and test data for each model. But the plots are not good to interpreted due to sparsity of high dimension data and lack of statistical power(I only got 20 genes). But it seems that RF is overfitting....
+
+```{r check_fit_plot, message=FALSE, warning=FALSE}
+
+compare |>
+  ggplot(aes(x = model_type, y = r2, color = split, group = split)) +
+  stat_summary(geom = "line", fun.y = "mean") +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.5),
+    alpha = 0.5
+  ) +
+  ylim(0, NA) +
+  guides(color = guide_legend(override.aes = list(alpha = 1)))
+
+
+compare |>
+  ggplot(aes(x = model_type, y = rmse, color = split, group = split)) +
+  stat_summary(geom = "line", fun.y = "mean") +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.5),
+    alpha = 0.5
+  ) +
+  ylim(0, NA) +
+  guides(color = guide_legend(override.aes = list(alpha = 1)))
+
+
+```
+
+## manipulate data and plot fig4
+
+```{r manipulate_plot4}
+
+# get the best model through r2
+
+r2 = compare |>
+  select(-rmse) |>
+  group_by(split,gene) |>
+  slice_max(r2) |>
+  select(-r2) |> 
+  ungroup() |>
+  group_by(split,model_type) |> 
+  summarise(count = n())
+
+# get the best model through rmse
+
+rmse = compare |>
+  select(-r2) |>
+  group_by(split,gene) |>
+  slice_min(rmse) |>
+  select(-rmse) |> 
+  ungroup() |>
+  group_by(split,model_type) |> 
+  summarise(count = n())
+
+# append the the two measurements results together
+
+both = bind_rows(rmse = rmse, r2 = r2, .id = 'measurement')
+
+
+
+# fill in the categories that have 0 count(not be selected as best model) to make sure every column has the same width.
+
+supp1 = data.frame(measurement = c("rmse","r2"), 
+              split = "test",
+              model_type = c("RF","Baseline"),
+              count = 0)
+supp2 = data.frame(measurement = "rmse", 
+              split = "train",
+              model_type = c("Baseline","LM","CRF"),
+              count = 0)
+supp3 = data.frame(measurement = "r2", 
+              split = "train",
+              model_type = c("Baseline","LM","CRF"),
+              count = 0)
+both = bind_rows(both,supp1,supp2,supp3)
+
+fig4 = both |> 
+  mutate(count = (count/20)*100)|>
+  ggplot(aes(x = split, y = count, fill = model_type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9),width = 0.8) +
+  facet_grid( .~ measurement) +
+  scale_fill_brewer(palette = "set1") +
+  labs(x = "", y = "Frequency of Gene Dependencies (%)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+fig4
+```
+
+
+
+## Save the results
+
+```{r}
+ggsave("fig4.png")
+```
+
+* Conclusion: According to this plot(20 genes),by comparing with the baseline models, we
+found that about 60% of gene dependencies could be successfully predicted from RPPA. 
