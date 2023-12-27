@@ -99,6 +99,7 @@ gene_venn = ggVennDiagram(x = list(CRISPR = genes_crispr, shRNA = genes_shrna),
   scale_fill_distiller(palette = "Reds", direction = 1) +
   scale_x_continuous(expand = expansion(mult = .3))
 
+gene_venn
 
 ggsave("gene_venn.png",width = 4, height = 4)
 
@@ -112,7 +113,7 @@ cell_venn = ggVennDiagram(x = list(CRISPR = cell_lines_crispr, shRNA = cell_line
   scale_fill_distiller(palette = "Reds", direction = 1) +
   scale_x_continuous(expand = expansion(mult = .3))
 
-
+cell_venn
 
 
 ggsave("cell_venn.png",width = 4, height = 4)
@@ -153,6 +154,8 @@ corr_cell_plot = ggplot(cell_correlation, aes(x = estimate, fill = category)) +
   labs(x = "Pearson Correlation",
        y = "Count")
 
+corr_cell_plot
+
 ggsave("corr_cell_plot.png",width = 4, height = 4)
 
 
@@ -173,6 +176,8 @@ corr_gene_plot = ggplot(gene_correlation, aes(x = estimate, fill = category)) +
   theme(legend.position = "top") +
   labs(x = "Pearson Correlation",
        y = "Count")
+
+corr_gene_plot
 
 ggsave("corr_gene_plot.png",width = 4, height = 4)
 
